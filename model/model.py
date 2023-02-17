@@ -13,7 +13,9 @@ from io import open
 
 import torch
 from torch import nn
-from apex.normalization.fused_layer_norm import FusedLayerNorm
+# from apex.normalization.fused_layer_norm import FusedLayerNorm
+# FIXME: layernorm
+from torch.nn import LayerNorm as FusedLayerNorm
 
 from .layer import BertLayer, BertPooler
 
@@ -35,7 +37,8 @@ class UniterConfig(object):
                  attention_probs_dropout_prob=0.1,
                  max_position_embeddings=512,
                  type_vocab_size=2,
-                 initializer_range=0.02):
+                 initializer_range=0.02,
+                 img_msk_emb=True):
         """Constructs UniterConfig.
         Args:
             vocab_size_or_config_json_file: Vocabulary size of `inputs_ids` in
@@ -80,6 +83,7 @@ class UniterConfig(object):
             self.max_position_embeddings = max_position_embeddings
             self.type_vocab_size = type_vocab_size
             self.initializer_range = initializer_range
+            self.img_msk_emb = img_msk_emb
         else:
             raise ValueError("First argument must be either a vocabulary size "
                              "(int) or the path to a pretrained model config "
@@ -252,7 +256,9 @@ class UniterImageEmbeddings(nn.Module):
         self.img_layer_norm = FusedLayerNorm(config.hidden_size, eps=1e-12)
         self.pos_layer_norm = FusedLayerNorm(config.hidden_size, eps=1e-12)
         self.pos_linear = nn.Linear(7, config.hidden_size)
-        self.mask_embedding = nn.Embedding(2, img_dim, padding_idx=0)
+
+        if config.img_msk_emb:
+            self.mask_embedding = nn.Embedding(2, img_dim, padding_idx=0)
 
         # tf naming convention for layer norm
         self.LayerNorm = FusedLayerNorm(config.hidden_size, eps=1e-12)

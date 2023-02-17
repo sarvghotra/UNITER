@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Listen (5678)",
+            "type": "python",
+            "request": "attach",
+            "listen": {
+                "host": "0.0.0.0",
+                "port": 5678
+            },
+        },
+        {
+            "name": "Listen (5679)",
+            "type": "python",
+            "request": "attach",
+            "listen": {
+                "host": "cn-a002",
+                "port": 5679
+            },
+        }
+    ]
+}

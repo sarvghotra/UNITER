@@ -9,7 +9,8 @@ from collections import defaultdict
 import torch
 from torch import nn
 from torch.nn import functional as F
-from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+# from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+from torch.nn import LayerNorm
 
 from .layer import GELU, BertOnlyMLMHead
 from .model import UniterModel, UniterPreTrainedModel

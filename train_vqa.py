@@ -7,6 +7,7 @@ UNITER finetuning for VQA
 import argparse
 import json
 import os
+import numpy as np
 from os.path import abspath, dirname, exists, join
 from time import time
 
@@ -16,8 +17,11 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.optim import Adam, Adamax
 
-from apex import amp
-from horovod import torch as hvd
+# from apex import amp
+# from horovod import torch as hvd
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import blip_utils
 
 from tqdm import tqdm
 
@@ -25,10 +29,12 @@ from data import (TokenBucketSampler, PrefetchLoader,
                   TxtTokLmdb, ImageLmdbGroup, ConcatDatasetWithLens,
                   VqaDataset, VqaEvalDataset,
                   vqa_collate, vqa_eval_collate)
+from data.loader import move_to_cuda
+from utils.distributed import DistributedTokenBucketSampler
 from model.vqa import UniterForVisualQuestionAnswering
 from optim import AdamW, get_lr_sched
 
-from utils.logger import LOGGER, TB_LOGGER, RunningMeter, add_log_to_file
+from utils.logger import LOGGER, TB_LOGGER, RunningMeter, add_log_to_file, SetupWandb
 from utils.distributed import (all_reduce_and_rescale_tensors, all_gather_list,
                                broadcast_tensors)
 from utils.save import ModelSaver, save_training_meta
@@ -39,12 +45,19 @@ from utils.const import BUCKET_SIZE, IMG_DIM
 def build_dataloader(dataset, collate_fn, is_train, opts):
     batch_size = (opts.train_batch_size if is_train
                   else opts.val_batch_size)
-    sampler = TokenBucketSampler(dataset.lens, bucket_size=BUCKET_SIZE,
-                                 batch_size=batch_size, droplast=is_train)
+    # sampler = TokenBucketSampler(dataset.lens, bucket_size=BUCKET_SIZE,
+    #                              batch_size=batch_size, droplast=is_train)
+    sampler = DistributedTokenBucketSampler(dataset,
+                                rank=blip_utils.get_rank(),
+                                num_replicas=blip_utils.get_world_size(),
+                                lens=dataset.lens,
+                                bucket_size=BUCKET_SIZE,
+                                batch_size=batch_size, drop_last=is_train)
     dataloader = DataLoader(dataset, batch_sampler=sampler,
                             num_workers=opts.n_workers,
                             pin_memory=opts.pin_mem, collate_fn=collate_fn)
-    dataloader = PrefetchLoader(dataloader)
+    # FIXME: figure out if this was needed?
+    # dataloader = PrefetchLoader(dataloader)
     return dataloader
 
 
@@ -87,15 +100,24 @@ def build_optimizer(model, opts):
 
 
 def main(opts):
-    hvd.init()
-    n_gpu = hvd.size()
-    device = torch.device("cuda", hvd.local_rank())
-    torch.cuda.set_device(hvd.local_rank())
-    rank = hvd.rank()
+    blip_utils.init_distributed_mode(opts)
+    n_gpu = blip_utils.get_world_size()
+    device = torch.device(opts.device) #"cuda", blip_utils.local_rank())
+    # torch.cuda.set_device(blip_utils.get_local_rank(opts))
+    rank = blip_utils.get_rank()
     opts.rank = rank
+
+    # setup wandb
+    wb_logger = SetupWandb(opts.exp_name, opts)
+    wb_logger({
+        'device': opts.device,
+        'n_gpu': n_gpu,
+        'rank': blip_utils.get_rank(),
+        '16-bits training': opts.fp16
+    })
     LOGGER.info("device: {} n_gpu: {}, rank: {}, "
                 "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), opts.fp16))
+                    device, n_gpu, blip_utils.get_rank(), opts.fp16))
 
     if opts.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, "
@@ -143,16 +165,20 @@ def main(opts):
         opts.model_config, checkpoint,
         img_dim=IMG_DIM, num_answer=len(ans2label))
     model.to(device)
+    model = DDP(model, device_ids=[opts.gpu]) #, find_unused_parameters=True)
+
     # make sure every process has same model parameters in the beginning
-    broadcast_tensors([p.data for p in model.parameters()], 0)
+    # broadcast_tensors([p.data for p in model.parameters()], 0)
     set_dropout(model, opts.dropout)
 
     # Prepare optimizer
     optimizer = build_optimizer(model, opts)
-    model, optimizer = amp.initialize(model, optimizer,
-                                      enabled=opts.fp16, opt_level='O2')
+    scaler = torch.cuda.amp.GradScaler()
+    # model, optimizer = amp.initialize(model, optimizer,
+    #                                   enabled=opts.fp16, opt_level='O2')
+
     global_step = 0
-    if rank == 0:
+    if blip_utils.is_main_process():
         save_training_meta(opts)
         TB_LOGGER.create(join(opts.output_dir, 'log'))
         pbar = tqdm(total=opts.num_train_steps)
@@ -167,12 +193,20 @@ def main(opts):
         model_saver = NoOp()
 
     LOGGER.info(f"***** Running training with {n_gpu} GPUs *****")
-    LOGGER.info("  Num examples = %d", len(train_dataset) * hvd.size())
+    LOGGER.info("  Num examples = %d", len(train_dataset))
     LOGGER.info("  Batch size = %d", opts.train_batch_size)
     LOGGER.info("  Accumulate steps = %d", opts.gradient_accumulation_steps)
     LOGGER.info("  Num steps = %d", opts.num_train_steps)
 
+    wb_logger({'num_examples': len(train_dataset),
+        'train_batch_size': opts.train_batch_size,
+        'gradient_accumulation_steps': opts.gradient_accumulation_steps,
+        'num_train_steps': opts.num_train_steps
+    })
+
     running_loss = RunningMeter('loss')
+    curr_losses = []
+    # has_non_nan_loss = False
     model.train()
     n_examples = 0
     n_epoch = 0
@@ -182,23 +216,43 @@ def main(opts):
     optimizer.step()
     while True:
         for step, batch in enumerate(train_dataloader):
+            batch = move_to_cuda(batch)
             n_examples += batch['input_ids'].size(0)
 
-            loss = model(batch, compute_loss=True)
-            loss = loss.mean() * batch['targets'].size(1)  # instance-leval bce
-            delay_unscale = (step+1) % opts.gradient_accumulation_steps != 0
-            with amp.scale_loss(loss, optimizer, delay_unscale=delay_unscale
-                                ) as scaled_loss:
-                scaled_loss.backward()
-                if not delay_unscale:
-                    # gather gradients from every processes
-                    # do this before unscaling to make sure every process uses
-                    # the same gradient scale
-                    grads = [p.grad.data for p in model.parameters()
-                             if p.requires_grad and p.grad is not None]
-                    all_reduce_and_rescale_tensors(grads, float(1))
+            enabled = True if opts.fp16 else False
+            with torch.cuda.amp.autocast(enabled=enabled, dtype=torch.float16):
+                loss = model(batch, compute_loss=True)
+                loss = loss.mean() * batch['targets'].size(1)  # instance-leval bce
+                loss = loss / opts.gradient_accumulation_steps
 
-            running_loss(loss.item())
+            scaled_loss = scaler.scale(loss)
+            scaled_loss.backward()
+            if not torch.isnan(scaled_loss):
+                curr_losses.append(loss.item())
+                # has_non_nan_loss = True
+
+            if (step+1) % opts.gradient_accumulation_steps == 0 or (step+1) == len(train_dataloader):
+                scaler.unscale_(optimizer)
+
+                if opts.grad_norm != -1:
+                    grad_norm = clip_grad_norm_(model.parameters(),
+                                                opts.grad_norm)
+
+                    TB_LOGGER.add_scalar('grad_norm', grad_norm, global_step)
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+                # Native code
+                # optimizer.step()
+                # optimizer.zero_grad()
+                pbar.update(1)
+
+                if len(curr_losses) > 0:
+                    running_loss(np.mean(curr_losses))
+                    # has_non_nan_loss = False
+                    curr_losses = []
 
             if (step + 1) % opts.gradient_accumulation_steps == 0:
                 global_step += 1
@@ -219,19 +273,11 @@ def main(opts):
                 TB_LOGGER.add_scalar('loss', running_loss.val, global_step)
                 TB_LOGGER.step()
 
-                # update model params
-                if opts.grad_norm != -1:
-                    grad_norm = clip_grad_norm_(amp.master_params(optimizer),
-                                                opts.grad_norm)
-                    TB_LOGGER.add_scalar('grad_norm', grad_norm, global_step)
-                optimizer.step()
-                optimizer.zero_grad()
-                pbar.update(1)
-
                 if global_step % 100 == 0:
                     # monitor training throughput
                     LOGGER.info(f'============Step {global_step}=============')
-                    tot_ex = sum(all_gather_list(n_examples))
+                    tot_ex = sum(all_gather(n_examples))
+                    # tot_ex = n_examples * blip_utils.get_world_size()
                     ex_per_sec = int(tot_ex / (time()-start))
                     LOGGER.info(f'{tot_ex} examples trained at '
                                 f'{ex_per_sec} ex/s')
@@ -239,14 +285,23 @@ def main(opts):
                                          ex_per_sec, global_step)
                     LOGGER.info(f'===========================================')
 
+                    wb_logger({'train/loss': running_loss.val,
+                        'train/lr': lr_this_step,
+                        'train/ex_per_sec': ex_per_sec,
+                        'train/step': global_step
+                    })
+
                 if global_step % opts.valid_steps == 0:
-                    val_log, results = validate(
+                    val_log, results = dist_validate(
                         model, val_dataloader, label2ans)
-                    with open(f'{opts.output_dir}/results/'
-                              f'results_{global_step}_'
-                              f'rank{rank}.json', 'w') as f:
-                        json.dump(results, f)
+                    if blip_utils.is_main_process():
+                        with open(f'{opts.output_dir}/results/'
+                                f'results_{global_step}_'
+                                f'rank{rank}.json', 'w') as f:
+                            json.dump(results, f)
                     TB_LOGGER.log_scaler_dict(val_log)
+                    val_log['train/step'] = global_step
+                    wb_logger(val_log, prefix='train/')
                     model_saver.save(model, global_step)
             if global_step >= opts.num_train_steps:
                 break
@@ -254,13 +309,17 @@ def main(opts):
             break
         n_epoch += 1
         LOGGER.info(f"finished {n_epoch} epochs")
+
     if opts.num_train_steps % opts.valid_steps != 0:
-        val_log, results = validate(model, val_dataloader, label2ans)
-        with open(f'{opts.output_dir}/results/'
-                  f'results_{global_step}_'
-                  f'rank{rank}.json', 'w') as f:
-            json.dump(results, f)
+        val_log, results = dist_validate(model, val_dataloader, label2ans)
+        if blip_utils.is_main_process():
+            with open(f'{opts.output_dir}/results/'
+                    f'results_{global_step}_'
+                    f'rank{rank}.json', 'w') as f:
+                json.dump(results, f)
         TB_LOGGER.log_scaler_dict(val_log)
+        val_log['train/step'] = global_step
+        wb_logger(val_log, prefix='train/')
         model_saver.save(model, global_step)
 
 
@@ -271,9 +330,10 @@ def validate(model, val_loader, label2ans):
     val_loss = 0
     tot_score = 0
     n_ex = 0
-    st = time()
+
     results = {}
     for i, batch in enumerate(val_loader):
+        batch = move_to_cuda(batch)
         scores = model(batch, compute_loss=False)
         targets = batch['targets']
         loss = F.binary_cross_entropy_with_logits(
@@ -286,19 +346,66 @@ def validate(model, val_loader, label2ans):
         for qid, answer in zip(batch['qids'], answers):
             results[qid] = answer
         n_ex += len(batch['qids'])
-    val_loss = sum(all_gather_list(val_loss))
-    tot_score = sum(all_gather_list(tot_score))
-    n_ex = sum(all_gather_list(n_ex))
+
+    return n_ex, tot_score, val_loss, results
+
+    # val_loss = sum(all_gather_list(val_loss))
+    # tot_score = sum(all_gather_list(tot_score))
+    # n_ex = sum(all_gather_list(n_ex))
+
+    # tot_time = time()-st
+    # val_loss /= n_ex
+    # val_acc = tot_score / n_ex
+    # val_log = {'valid/loss': val_loss,
+    #            'valid/acc': val_acc,
+    #            'valid/ex_per_s': n_ex/tot_time}
+    # model.train()
+    # LOGGER.info(f"validation finished in {int(tot_time)} seconds, "
+    #             f"score: {val_acc*100:.2f}")
+    # # return val_log, results
+
+    # return
+
+
+def all_gather(results):
+    world_size = dist.get_world_size()
+    all_results = [None for _ in range(world_size)]
+    dist.all_gather_object(all_results, results)
+    return all_results
+
+
+#FIXME: test validate with and w/o dist
+@torch.no_grad()
+def dist_validate(model, val_loader, label2ans):
+    st = time()
+    n_ex, tot_score, val_loss, results = validate(model, val_loader, label2ans)
+
+    all_results = all_gather(results)
+
+    all_n_ex = sum(all_gather(n_ex))
+    all_tot_score = sum(all_gather(tot_score))
+    all_val_loss = sum(all_gather(val_loss))
+
+    # val_loss = sum(all_gather_list(val_loss))
+    # tot_score = sum(all_gather_list(tot_score))
+    # n_ex = sum(all_gather_list(n_ex))
+
     tot_time = time()-st
-    val_loss /= n_ex
-    val_acc = tot_score / n_ex
-    val_log = {'valid/loss': val_loss,
-               'valid/acc': val_acc,
-               'valid/ex_per_s': n_ex/tot_time}
+    all_val_loss /= n_ex
+    all_val_acc = all_tot_score / n_ex
+    val_log = {'valid/loss': all_val_loss,
+               'valid/acc': all_val_acc,
+               'valid/ex_per_s': all_n_ex/tot_time}
     model.train()
     LOGGER.info(f"validation finished in {int(tot_time)} seconds, "
-                f"score: {val_acc*100:.2f}")
-    return val_log, results
+                f"score: {all_val_acc*100:.2f}")
+    # return val_log, results
+
+    return val_log, all_results
+
+
+
+
 
 
 def compute_score_with_logits(logits, labels):
@@ -385,6 +492,12 @@ if __name__ == "__main__":
 
     # can use config files
     parser.add_argument('--config', help='JSON config files')
+
+    # DDP parameters
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
+    parser.add_argument('--distributed', action='store_true', help='use distributed training')
 
     args = parse_with_config(parser)
 

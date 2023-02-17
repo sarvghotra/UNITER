@@ -8,7 +8,8 @@ from collections import defaultdict
 
 from torch import nn
 from torch.nn import functional as F
-from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+# from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+from torch.nn import LayerNorm
 
 # from .layer import GELU
 from .model import (

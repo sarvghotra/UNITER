@@ -8,6 +8,9 @@ NOTE: loggers are global objects use with caution
 import logging
 import math
 
+import blip_utils
+import wandb
+
 import tensorboardX
 
 
@@ -92,3 +95,29 @@ class RunningMeter(object):
     @property
     def name(self):
         return self._name
+
+
+class SetupWandb:
+    """Setup wandb for logging"""
+    def __init__(self, exp_name, config):
+        if blip_utils.is_main_process():
+            wandb.init(project="transfer-bottleneck",
+                            entity="sarvghotra",
+                            # notes="VQAv2 exp",
+                            # tags=["debug", "gdss"],
+                            allow_val_change=True,
+                            name=exp_name,
+                            config=config,
+                            resume='allow',)
+
+            wandb.define_metric("train/step")
+            wandb.define_metric("val/step")
+            # wandb.define_metric("grad_norms/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("val/*", step_metric="val/step")
+            # wandb.define_metric("grad_norms/*", step_metric="grad_norms/step")
+
+    def __call__(self, log_dict, prefix=''):
+        if blip_utils.is_main_process():
+            for name, value in log_dict.items():
+                wandb.log({f'{prefix}{name}': value})

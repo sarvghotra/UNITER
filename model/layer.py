@@ -22,7 +22,8 @@ import math
 
 import torch
 from torch import nn
-from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
+# from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
+from torch.nn import LayerNorm as BertLayerNorm
 
 
 logger = logging.getLogger(__name__)

@@ -10,7 +10,8 @@ import torch
 from torch import nn
 import random
 import numpy as np
-from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+# from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+from torch.nn import LayerNorm
 
 from .layer import GELU
 from .model import UniterPreTrainedModel, UniterModel
