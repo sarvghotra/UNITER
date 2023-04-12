@@ -233,11 +233,11 @@ class DetectFeatTxtTokDataset(Dataset):
         assert isinstance(img_db, DetectFeatLmdb)
         self.txt_db = txt_db
         self.img_db = img_db
-        txt_lens, self.ids = get_ids_and_lens(txt_db)
+        self.txt_lens, self.ids = get_ids_and_lens(txt_db)
 
         txt2img = txt_db.txt2img
         self.lens = [tl + self.img_db.name2nbb[txt2img[id_]]
-                     for tl, id_ in zip(txt_lens, self.ids)]
+                     for tl, id_ in zip(self.txt_lens, self.ids)]
 
     def __len__(self):
         return len(self.ids)

@@ -68,3 +68,12 @@ def set_random_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def cal_epoch_len(dataloader, batch_size, grad_acc_steps):
+    return len(dataloader) // (grad_acc_steps * batch_size)
+
+
+def create_kl_loss():
+    kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
+    return kl_loss

@@ -7,7 +7,7 @@ from .data import (TxtTokLmdb, DetectFeatLmdb,
                    ImageLmdbGroup, ConcatDatasetWithLens)
 from .sampler import TokenBucketSampler
 from .loader import PrefetchLoader, MetaLoader
-from .vqa import VqaDataset, VqaEvalDataset, vqa_collate, vqa_eval_collate
+from .vqa import VqaDataset, VqaEvalDataset, HackyVqaOODEvalDataset, GQVQAEvalDataset, vqa_collate, vqa_eval_collate
 from .ve import VeDataset, VeEvalDataset, ve_collate, ve_eval_collate
 from .nlvr2 import (Nlvr2PairedDataset, Nlvr2PairedEvalDataset,
                     Nlvr2TripletDataset, Nlvr2TripletEvalDataset,
